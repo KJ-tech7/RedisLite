@@ -116,43 +116,58 @@ public class RedisStore {
     }
 
     private synchronized void saveToDisk() throws IOException {
-        Files.createDirectories(dataFile.getParent());
+        Path parent = dataFile.getParent();
+        Files.createDirectories(parent);
 
-        Path tempFile = dataFile.resolveSibling(
-                dataFile.getFileName() + ".tmp"
+        // Create a unique temporary file beside the database file.
+        Path tempFile = Files.createTempFile(
+                parent,
+                dataFile.getFileName().toString() + ".",
+                ".tmp"
         );
 
-        try (var writer = Files.newBufferedWriter(
-                tempFile, StandardCharsets.UTF_8)) {
-
-            for (Map.Entry<String, Entry> item : data.entrySet()) {
-                Entry entry = item.getValue();
-
-                if (entry.isExpired()) {
-                    continue;
-                }
-
-                String key = encode(item.getKey());
-                String value = encode(entry.value);
-
-                writer.write(entry.expiresAt + "\t" + key + "\t" + value);
-                writer.newLine();
-            }
-        }
-
         try {
-            Files.move(
-                    tempFile,
-                    dataFile,
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE
-            );
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(
-                    tempFile,
-                    dataFile,
-                    StandardCopyOption.REPLACE_EXISTING
-            );
+            // Write the complete snapshot before replacing the database.
+            try (var writer = Files.newBufferedWriter(
+                    tempFile, StandardCharsets.UTF_8)) {
+
+                for (Map.Entry<String, Entry> item : data.entrySet()) {
+                    Entry entry = item.getValue();
+
+                    if (entry.isExpired()) {
+                        continue;
+                    }
+
+                    String key = encode(item.getKey());
+                    String value = encode(entry.value);
+
+                    writer.write(
+                            entry.expiresAt + "\t" + key + "\t" + value
+                    );
+                    writer.newLine();
+                }
+            }
+
+            // Replace the old database only after writing succeeds.
+            try {
+                Files.move(
+                        tempFile,
+                        dataFile,
+                        StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE
+                );
+            } catch (AtomicMoveNotSupportedException e) {
+                // Fallback for filesystems without atomic move support.
+                Files.move(
+                        tempFile,
+                        dataFile,
+                        StandardCopyOption.REPLACE_EXISTING
+                );
+            }
+
+        } finally {
+            // Remove leftover temporary files after success or failure.
+            Files.deleteIfExists(tempFile);
         }
     }
 
@@ -170,6 +185,7 @@ public class RedisStore {
                 String[] parts = line.split("\t", 3);
 
                 if (parts.length != 3) {
+                    System.err.println("Skipping an invalid database record.");
                     continue;
                 }
 
@@ -180,12 +196,16 @@ public class RedisStore {
                 if (expiresAt == 0 || expiresAt > now) {
                     data.put(key, new Entry(value, expiresAt));
                 }
+
             } catch (IllegalArgumentException e) {
-                System.err.println("Skipping an invalid record in the data file.");
+                System.err.println(
+                        "Skipping an invalid record in the data file."
+                );
             }
         }
 
-        saveToDisk();
+        // Important: Do not rewrite the database during startup.
+        // This preserves the original file if malformed records are found.
     }
 
     private String encode(String value) {
